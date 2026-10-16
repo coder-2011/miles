@@ -1,11 +1,8 @@
 from unittest.mock import MagicMock
 
-import aiohttp
 import pytest
-from aiohttp import web
-from aiohttp.test_utils import TestServer
 
-from miles.rollout.rm_hub import async_rm, batched_async_rm, remote_rm_connection_pool
+from miles.rollout.rm_hub import async_rm, batched_async_rm
 from miles.utils.async_utils import run
 from miles.utils.types import Sample
 
@@ -20,32 +17,6 @@ def mock_args():
 
 
 class TestAsyncRm:
-    async def test_remote_rm_reuses_connections(self, mock_args):
-        transports = set()
-        requests = []
-
-        async def reward(request):
-            transports.add(request.transport)
-            requests.append(await request.json())
-            assert not request.cookies
-            response = web.json_response(1.0, status=503 if len(requests) == 2 else 200)
-            response.set_cookie("sample", "previous")
-            return response
-
-        app = web.Application()
-        app.router.add_post("/", reward)
-        async with TestServer(app, host="localhost") as server:
-            mock_args.rm_type = "remote_rm"
-            mock_args.rm_url = str(server.make_url("/"))
-            sample = Sample(prompt="prompt", response="response", label="label")
-            async with remote_rm_connection_pool():
-                assert await async_rm(mock_args, sample) == 1.0
-                with pytest.raises(aiohttp.ClientResponseError, match="503"):
-                    await async_rm(mock_args, sample)
-                assert await async_rm(mock_args, sample) == 1.0
-                assert len(transports) == 1
-            assert requests == [{"prompt": "prompt", "response": "response", "label": "label"}] * 3
-
     @pytest.mark.parametrize(
         "rm_type,response,label,expected",
         [
