@@ -1,7 +1,12 @@
+import asyncio
 from unittest.mock import MagicMock
 
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
+from miles.rollout import rm_hub
 from miles.rollout.rm_hub import async_rm, batched_async_rm
 from miles.utils.async_utils import run
 from miles.utils.types import Sample
@@ -17,6 +22,87 @@ def mock_args():
 
 
 class TestAsyncRm:
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_remote_rm_reuses_connections(self, mock_args, fail):
+        async def check():
+            transports = set()
+            requests = []
+
+            async def redirect(request):
+                assert not request.cookies
+                response = web.HTTPTemporaryRedirect("/reward")
+                response.set_cookie("sample", "current")
+                raise response
+
+            async def reward(request):
+                transports.add(request.transport)
+                requests.append(await request.json())
+                assert request.cookies["sample"] == "current"
+                return web.json_response(1.0, status=503 if fail and len(requests) == 2 else 200)
+
+            app = web.Application()
+            app.router.add_post("/", redirect)
+            app.router.add_post("/reward", reward)
+            # IP hosts make aiohttp ignore cookies, masking cookie leakage between samples.
+            async with TestServer(app, host="localhost") as server:
+                mock_args.rm_type = "remote_rm"
+                mock_args.rm_url = str(server.make_url("/"))
+                sample = Sample(prompt="prompt", response="response", label="label")
+                resume = asyncio.Event()
+
+                async def after_pool_closes():
+                    await resume.wait()
+                    return await async_rm(mock_args, sample)
+
+                async with rm_hub.remote_rm_connection_pool():
+                    connector = rm_hub._remote_rm_pool.get()[1]
+                    assert await async_rm(mock_args, sample) == 1.0
+                    if fail:
+                        with pytest.raises(aiohttp.ClientResponseError, match="503"):
+                            await async_rm(mock_args, sample)
+                    else:
+                        assert await async_rm(mock_args, sample) == 1.0
+                    assert await async_rm(mock_args, sample) == 1.0
+                    assert len(transports) == 1
+                    assert await asyncio.to_thread(lambda: asyncio.run(async_rm(mock_args, sample))) == 1.0
+                    pending = asyncio.create_task(after_pool_closes())
+                assert connector.closed
+                assert rm_hub._remote_rm_pool.get() is None
+                resume.set()
+                assert await pending == 1.0
+                assert len(transports) == 3
+                assert requests == [{"prompt": "prompt", "response": "response", "label": "label"}] * 5
+
+        run(check())
+
+    def test_remote_rm_closes_pending_request_on_error(self, mock_args):
+        async def check():
+            started = asyncio.Event()
+            disconnected = asyncio.Event()
+
+            async def reward(request):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    disconnected.set()
+
+            app = web.Application()
+            app.router.add_post("/", reward)
+            async with TestServer(app) as server:
+                mock_args.rm_type = "remote_rm"
+                mock_args.rm_url = str(server.make_url("/"))
+                with pytest.raises(ValueError, match="rollout failed"):
+                    async with rm_hub.remote_rm_connection_pool():
+                        pending = asyncio.create_task(async_rm(mock_args, Sample(prompt="")))
+                        await asyncio.wait_for(started.wait(), timeout=1)
+                        raise ValueError("rollout failed")
+                with pytest.raises(aiohttp.ClientError):
+                    await asyncio.wait_for(pending, timeout=1)
+                await asyncio.wait_for(disconnected.wait(), timeout=1)
+
+        run(check())
+
     @pytest.mark.parametrize(
         "rm_type,response,label,expected",
         [
